@@ -180,8 +180,8 @@ export default function ExifPreserverApp() {
   const [status, setStatus] = useState({ type: 'idle', msg: '이미지 파일을 기다리는 중...' });
   const [dragActive, setDragActive] = useState(false);
   
-  // App Logo (From user upload)
-  const appLogo = "image_7d3e3b.png"; // Assuming file path within context
+  // App Logo (Now using the file in public folder)
+  const appLogo = "/logo.jpg"; 
 
   // Step 1: Extract
   const handleExtract = async (file) => {
