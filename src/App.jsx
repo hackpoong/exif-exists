@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Download, Save, RefreshCw, FileImage, AlertCircle, CheckCircle, Info, ArrowRight } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Upload, Download, Save, RefreshCw, FileImage, AlertCircle, CheckCircle, Info } from 'lucide-react';
 
 // Piexifjs library for JPG handling
 const LoadScripts = () => {
@@ -111,47 +111,75 @@ async function extractPngMetadata(file) {
   return chunks.length > 0 ? { type: 'png', data: chunks } : null;
 }
 
-// Inject multiple chunks into PNG (Correctly after IHDR)
-async function injectPngMetadata(file, chunks) {
+// Inject multiple chunks into PNG (Re-assembly method)
+// This method parses the target file chunk by chunk, removes existing AI metadata,
+// and inserts the new metadata right after IHDR.
+async function injectPngMetadata(file, newMetadataChunks) {
   const originalBuffer = await file.arrayBuffer();
   const view = new DataView(originalBuffer);
+  const textDecoder = new TextDecoder('utf-8');
 
-  // 1. Validate and find IHDR end
-  // Signature (8 bytes) + IHDR Length (4 bytes) + IHDR Type (4 bytes) -> Data -> CRC (4 bytes)
+  // 1. Validate Signature
   if (view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) {
     throw new Error("유효한 PNG 파일이 아닙니다.");
   }
-  
-  // IHDR must be the first chunk
-  const ihdrLength = view.getUint32(8);
-  // 8(Sig) + 4(Len) + 4(Type) + Data(ihdrLength) + 4(CRC)
-  const ihdrEndIndex = 8 + 4 + 4 + ihdrLength + 4;
 
-  // 2. Generate new chunk buffers
-  const newChunkBuffers = [];
-  let totalNewChunkSize = 0;
+  const chunksToKeep = [];
+  let offset = 8; // Skip signature
 
-  for (const chunk of chunks) {
-    const buffer = createPngTextChunk(chunk.keyword, chunk.text);
-    newChunkBuffers.push(buffer);
-    totalNewChunkSize += buffer.length;
+  // Add Signature first
+  chunksToKeep.push(new Uint8Array(originalBuffer.slice(0, 8)));
+
+  // 2. Parse chunks
+  while (offset < originalBuffer.byteLength) {
+    const length = view.getUint32(offset);
+    const type = textDecoder.decode(new Uint8Array(originalBuffer, offset + 4, 4));
+    const fullChunkSize = 12 + length; // Len(4) + Type(4) + Data(Len) + CRC(4)
+    
+    let shouldKeep = true;
+
+    // Filter out existing AI metadata from the target file
+    if (type === 'tEXt') {
+      const chunkData = new Uint8Array(originalBuffer, offset + 8, length);
+      let nullIndex = -1;
+      for (let i = 0; i < length; i++) {
+        if (chunkData[i] === 0) {
+          nullIndex = i;
+          break;
+        }
+      }
+      if (nullIndex > -1) {
+        const keyword = textDecoder.decode(chunkData.slice(0, nullIndex));
+        if (['parameters', 'prompt', 'workflow'].includes(keyword)) {
+          shouldKeep = false; // Drop this chunk (it's the broken/old metadata)
+        }
+      }
+    }
+
+    if (shouldKeep) {
+      chunksToKeep.push(new Uint8Array(originalBuffer.slice(offset, offset + fullChunkSize)));
+    }
+
+    // If this was IHDR, insert our NEW metadata right after it
+    if (type === 'IHDR') {
+      for (const meta of newMetadataChunks) {
+        chunksToKeep.push(createPngTextChunk(meta.keyword, meta.text));
+      }
+    }
+
+    offset += fullChunkSize;
   }
 
-  // 3. Create final buffer
-  const finalBuffer = new Uint8Array(originalBuffer.byteLength + totalNewChunkSize);
+  // 3. Assemble final blob
+  // Calculate total size
+  const totalSize = chunksToKeep.reduce((acc, chunk) => acc + chunk.length, 0);
+  const finalBuffer = new Uint8Array(totalSize);
   
-  // Part A: Signature + IHDR (Copy strictly up to the end of IHDR)
-  finalBuffer.set(new Uint8Array(originalBuffer.slice(0, ihdrEndIndex)), 0);
-  
-  // Part B: Insert New Metadata Chunks
-  let currentOffset = ihdrEndIndex;
-  for (const buf of newChunkBuffers) {
-      finalBuffer.set(buf, currentOffset);
-      currentOffset += buf.length;
+  let currentPos = 0;
+  for (const chunk of chunksToKeep) {
+    finalBuffer.set(chunk, currentPos);
+    currentPos += chunk.length;
   }
-  
-  // Part C: The rest of the original file (IDAT, IEND, etc.)
-  finalBuffer.set(new Uint8Array(originalBuffer.slice(ihdrEndIndex)), currentOffset);
 
   return new Blob([finalBuffer], { type: 'image/png' });
 }
