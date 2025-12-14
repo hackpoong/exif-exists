@@ -79,7 +79,7 @@ async function extractPngMetadata(file) {
   }
 
   let offset = 8;
-  let chunks = []; // Store multiple chunks (A1111 has 1, ComfyUI has 2+)
+  let chunks = []; 
 
   while (offset < buffer.byteLength) {
     const length = view.getUint32(offset);
@@ -111,13 +111,25 @@ async function extractPngMetadata(file) {
   return chunks.length > 0 ? { type: 'png', data: chunks } : null;
 }
 
-// Inject multiple chunks into PNG
+// Inject multiple chunks into PNG (Correctly after IHDR)
 async function injectPngMetadata(file, chunks) {
   const originalBuffer = await file.arrayBuffer();
+  const view = new DataView(originalBuffer);
+
+  // 1. Validate and find IHDR end
+  // Signature (8 bytes) + IHDR Length (4 bytes) + IHDR Type (4 bytes) -> Data -> CRC (4 bytes)
+  if (view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) {
+    throw new Error("유효한 PNG 파일이 아닙니다.");
+  }
   
-  // 1. Generate new chunk buffers for all found metadata
-  let totalNewChunkSize = 0;
+  // IHDR must be the first chunk
+  const ihdrLength = view.getUint32(8);
+  // 8(Sig) + 4(Len) + 4(Type) + Data(ihdrLength) + 4(CRC)
+  const ihdrEndIndex = 8 + 4 + 4 + ihdrLength + 4;
+
+  // 2. Generate new chunk buffers
   const newChunkBuffers = [];
+  let totalNewChunkSize = 0;
 
   for (const chunk of chunks) {
     const buffer = createPngTextChunk(chunk.keyword, chunk.text);
@@ -125,26 +137,27 @@ async function injectPngMetadata(file, chunks) {
     totalNewChunkSize += buffer.length;
   }
 
-  // 2. Create final buffer
+  // 3. Create final buffer
   const finalBuffer = new Uint8Array(originalBuffer.byteLength + totalNewChunkSize);
   
-  // 3. Assemble: Signature (8) + New Chunks + Original Rest
-  finalBuffer.set(new Uint8Array(originalBuffer.slice(0, 8)), 0);
+  // Part A: Signature + IHDR (Copy strictly up to the end of IHDR)
+  finalBuffer.set(new Uint8Array(originalBuffer.slice(0, ihdrEndIndex)), 0);
   
-  let currentOffset = 8;
+  // Part B: Insert New Metadata Chunks
+  let currentOffset = ihdrEndIndex;
   for (const buf of newChunkBuffers) {
       finalBuffer.set(buf, currentOffset);
       currentOffset += buf.length;
   }
   
-  finalBuffer.set(new Uint8Array(originalBuffer.slice(8)), currentOffset);
+  // Part C: The rest of the original file (IDAT, IEND, etc.)
+  finalBuffer.set(new Uint8Array(originalBuffer.slice(ihdrEndIndex)), currentOffset);
 
   return new Blob([finalBuffer], { type: 'image/png' });
 }
 
 
 // --- JPG Helpers (using window.piexif) ---
-// ... (JPG helpers remain same as simple EXIF)
 
 async function extractJpgMetadata(file) {
   return new Promise((resolve, reject) => {
@@ -215,7 +228,6 @@ export default function ExifPreserverApp() {
         setCachedMetadata(result);
         setSourceFileName(file.name);
         
-        // Show specific success message based on what was found
         let successDetail = "";
         if (result.type === 'png') {
             const keywords = result.data.map(c => c.keyword);
@@ -397,6 +409,7 @@ export default function ExifPreserverApp() {
                     
                     {processedImage ? (
                         <div className="relative w-full h-full flex flex-col items-center justify-center z-10">
+                            {/* Corrected Preview Image Z-Index Handling */}
                             <img src={processedImage.url} className="absolute inset-0 w-full h-full object-contain opacity-50 blur-sm" alt="result" />
                             <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center space-y-4 z-20">
                                 <CheckCircle size={48} className="text-green-400" />
