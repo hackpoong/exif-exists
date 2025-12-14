@@ -1,0 +1,15 @@
+# Netlify 배포 설정
+# 이 파일이 있으면 사이트의 설정 메뉴를 건드리지 않아도 자동으로 적용됩니다.
+
+[build]
+  # Vite 빌드 명령어
+  command = "npm run build"
+  
+  # Vite가 결과물을 만드는 폴더 이름 (가장 중요!)
+  publish = "dist"
+
+[[redirects]]
+  # SPA(React) 라우팅 처리 (새로고침 시 404 방지)
+  from = "/*"
+  to = "/index.html"
+  status = 200
