@@ -1,10 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Upload, Download, Save, RefreshCw, FileImage, AlertCircle, CheckCircle, Info, ArrowRight } from 'lucide-react';
 
-// Piexifjs library for JPG handling (loaded via CDN logic wrapper or direct implementation logic if needed, 
-// but for simplicity in React single file, we load it dynamically or use a lighter approach).
-// We will use a script tag injection for piexifjs to handle JPG complex exif structures easily.
-
+// Piexifjs library for JPG handling
 const LoadScripts = () => {
   useEffect(() => {
     if (!window.piexif) {
@@ -17,7 +14,7 @@ const LoadScripts = () => {
   return null;
 };
 
-// --- PNG Helpers (Binary Manipulation for Stable Diffusion Parameters) ---
+// --- PNG Helpers (Binary Manipulation for Stable Diffusion & ComfyUI) ---
 
 const crcTable = [];
 for (let n = 0; n < 256; n++) {
@@ -43,60 +40,11 @@ function writeString(view, offset, string) {
   }
 }
 
-// Extract 'parameters' text chunk from PNG (Standard for SD/Reforge)
-async function extractPngMetadata(file) {
-  const buffer = await file.arrayBuffer();
-  const view = new DataView(buffer);
-  const textDecoder = new TextDecoder('utf-8'); // often latin1, but try utf-8
-  
-  // Validate PNG signature
-  if (view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) {
-    throw new Error("유효한 PNG 파일이 아닙니다.");
-  }
-
-  let offset = 8;
-  let parameters = null;
-
-  while (offset < buffer.byteLength) {
-    const length = view.getUint32(offset);
-    const type = textDecoder.decode(new Uint8Array(buffer, offset + 4, 4));
-    
-    if (type === 'tEXt') {
-      const chunkData = new Uint8Array(buffer, offset + 8, length);
-      // Split keyword and text by null separator
-      let nullIndex = -1;
-      for (let i = 0; i < length; i++) {
-        if (chunkData[i] === 0) {
-          nullIndex = i;
-          break;
-        }
-      }
-      
-      if (nullIndex > -1) {
-        const keyword = textDecoder.decode(chunkData.slice(0, nullIndex));
-        if (keyword === 'parameters') {
-            const text = textDecoder.decode(chunkData.slice(nullIndex + 1));
-            parameters = text;
-            break; // Found it
-        }
-      }
-    }
-    
-    offset += 12 + length; // Length(4) + Type(4) + Data(length) + CRC(4)
-  }
-
-  return parameters ? { type: 'png', data: parameters } : null;
-}
-
-// Inject 'parameters' chunk into PNG
-async function injectPngMetadata(file, metadataString) {
-  const originalBuffer = await file.arrayBuffer();
-  const keyword = "parameters";
-  
-  // Create the chunk data: keyword + null separator + text
+// Helper to create a single tEXt chunk
+function createPngTextChunk(keyword, text) {
   const encoder = new TextEncoder();
   const keyData = encoder.encode(keyword);
-  const textData = encoder.encode(metadataString);
+  const textData = encoder.encode(text);
   
   const chunkLength = keyData.length + 1 + textData.length;
   const chunkBuffer = new Uint8Array(chunkLength + 12); // Length(4) + Type(4) + Data + CRC(4)
@@ -113,22 +61,90 @@ async function injectPngMetadata(file, metadataString) {
   chunkBuffer[8 + keyData.length] = 0; // Null separator
   chunkBuffer.set(textData, 8 + keyData.length + 1);
   
-  // 4. CRC (Calculate on Type + Data)
+  // 4. CRC
   const crcInput = chunkBuffer.slice(4, 8 + chunkLength);
   view.setUint32(8 + chunkLength, crc32(crcInput));
 
-  // Combine: Signature + New Chunk + Original Data (minus signature)
-  // Note: Simple prepend after signature. More robust would be to insert before IDAT, but this usually works for SD readers.
-  const finalBuffer = new Uint8Array(originalBuffer.byteLength + chunkBuffer.length);
-  finalBuffer.set(new Uint8Array(originalBuffer.slice(0, 8)), 0); // Signature
-  finalBuffer.set(chunkBuffer, 8); // New Metadata Chunk
-  finalBuffer.set(new Uint8Array(originalBuffer.slice(8)), 8 + chunkBuffer.length); // Rest of file
+  return chunkBuffer;
+}
+
+// Extract 'parameters' (A1111) AND 'prompt'/'workflow' (ComfyUI)
+async function extractPngMetadata(file) {
+  const buffer = await file.arrayBuffer();
+  const view = new DataView(buffer);
+  const textDecoder = new TextDecoder('utf-8'); 
+  
+  if (view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) {
+    throw new Error("유효한 PNG 파일이 아닙니다.");
+  }
+
+  let offset = 8;
+  let chunks = []; // Store multiple chunks (A1111 has 1, ComfyUI has 2+)
+
+  while (offset < buffer.byteLength) {
+    const length = view.getUint32(offset);
+    const type = textDecoder.decode(new Uint8Array(buffer, offset + 4, 4));
+    
+    if (type === 'tEXt') {
+      const chunkData = new Uint8Array(buffer, offset + 8, length);
+      let nullIndex = -1;
+      for (let i = 0; i < length; i++) {
+        if (chunkData[i] === 0) {
+          nullIndex = i;
+          break;
+        }
+      }
+      
+      if (nullIndex > -1) {
+        const keyword = textDecoder.decode(chunkData.slice(0, nullIndex));
+        // Check for A1111 OR ComfyUI keywords
+        if (['parameters', 'prompt', 'workflow'].includes(keyword)) {
+            const text = textDecoder.decode(chunkData.slice(nullIndex + 1));
+            chunks.push({ keyword, text });
+        }
+      }
+    }
+    
+    offset += 12 + length; 
+  }
+
+  return chunks.length > 0 ? { type: 'png', data: chunks } : null;
+}
+
+// Inject multiple chunks into PNG
+async function injectPngMetadata(file, chunks) {
+  const originalBuffer = await file.arrayBuffer();
+  
+  // 1. Generate new chunk buffers for all found metadata
+  let totalNewChunkSize = 0;
+  const newChunkBuffers = [];
+
+  for (const chunk of chunks) {
+    const buffer = createPngTextChunk(chunk.keyword, chunk.text);
+    newChunkBuffers.push(buffer);
+    totalNewChunkSize += buffer.length;
+  }
+
+  // 2. Create final buffer
+  const finalBuffer = new Uint8Array(originalBuffer.byteLength + totalNewChunkSize);
+  
+  // 3. Assemble: Signature (8) + New Chunks + Original Rest
+  finalBuffer.set(new Uint8Array(originalBuffer.slice(0, 8)), 0);
+  
+  let currentOffset = 8;
+  for (const buf of newChunkBuffers) {
+      finalBuffer.set(buf, currentOffset);
+      currentOffset += buf.length;
+  }
+  
+  finalBuffer.set(new Uint8Array(originalBuffer.slice(8)), currentOffset);
 
   return new Blob([finalBuffer], { type: 'image/png' });
 }
 
 
 // --- JPG Helpers (using window.piexif) ---
+// ... (JPG helpers remain same as simple EXIF)
 
 async function extractJpgMetadata(file) {
   return new Promise((resolve, reject) => {
@@ -138,7 +154,7 @@ async function extractJpgMetadata(file) {
         const exifObj = window.piexif.load(e.target.result);
         resolve({ type: 'jpg', data: exifObj });
       } catch (err) {
-        resolve(null); // No EXIF or parse error
+        resolve(null); 
       }
     };
     reader.readAsDataURL(file);
@@ -152,15 +168,11 @@ async function injectJpgMetadata(file, metadataObj) {
       try {
         const exifStr = window.piexif.dump(metadataObj);
         const inserted = window.piexif.insert(exifStr, e.target.result);
-        
-        // Convert DataURL back to Blob
         const byteString = atob(inserted.split(',')[1]);
         const mimeString = inserted.split(',')[0].split(':')[1].split(';')[0];
         const ab = new ArrayBuffer(byteString.length);
         const ia = new Uint8Array(ab);
-        for (let i = 0; i < byteString.length; i++) {
-            ia[i] = byteString.charCodeAt(i);
-        }
+        for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
         const blob = new Blob([ab], { type: mimeString });
         resolve(blob);
       } catch (err) {
@@ -180,13 +192,12 @@ export default function ExifPreserverApp() {
   const [status, setStatus] = useState({ type: 'idle', msg: '이미지 파일을 기다리는 중...' });
   const [dragActive, setDragActive] = useState(false);
   
-  // App Logo (Now using the file in public folder)
   const appLogo = "/logo.jpg"; 
 
   // Step 1: Extract
   const handleExtract = async (file) => {
     setStatus({ type: 'loading', msg: '메타데이터 추출 중...' });
-    setProcessedImage(null); // Reset step 2 result
+    setProcessedImage(null); 
 
     try {
       let result = null;
@@ -196,7 +207,6 @@ export default function ExifPreserverApp() {
         if (!window.piexif) throw new Error("JPG 라이브러리 로딩 중... 잠시 후 다시 시도해주세요.");
         result = await extractJpgMetadata(file);
       } else if (file.type === 'image/webp') {
-        // WebP simple support warning
         setStatus({ type: 'error', msg: "WebP는 현재 실험적 지원입니다. PNG 사용을 권장합니다." });
         return; 
       }
@@ -204,9 +214,18 @@ export default function ExifPreserverApp() {
       if (result) {
         setCachedMetadata(result);
         setSourceFileName(file.name);
-        setStatus({ type: 'success', msg: `[${file.name}]에서 메타데이터를 성공적으로 저장했습니다!` });
+        
+        // Show specific success message based on what was found
+        let successDetail = "";
+        if (result.type === 'png') {
+            const keywords = result.data.map(c => c.keyword);
+            if (keywords.includes('workflow')) successDetail = "(ComfyUI)";
+            else if (keywords.includes('parameters')) successDetail = "(A1111)";
+        }
+        
+        setStatus({ type: 'success', msg: `[${file.name}]에서 메타데이터${successDetail}를 저장했습니다!` });
       } else {
-        setStatus({ type: 'error', msg: '이 이미지에는 복구할 AI 메타데이터(parameters/EXIF)가 없습니다.' });
+        setStatus({ type: 'error', msg: '이 이미지에는 복구할 AI 메타데이터가 없습니다.' });
       }
     } catch (e) {
       console.error(e);
@@ -226,7 +245,6 @@ export default function ExifPreserverApp() {
     try {
       let finalBlob = null;
 
-      // Handle Format Mismatch warnings
       if (file.type === 'image/png' && cachedMetadata.type !== 'png') {
         setStatus({ type: 'error', msg: '형식 불일치: PNG에는 PNG 메타데이터만 씌울 수 있습니다.' });
         return;
@@ -282,7 +300,6 @@ export default function ExifPreserverApp() {
       <div className="bg-gray-800 border-b border-gray-700 p-4 shadow-lg">
         <div className="max-w-4xl mx-auto flex items-center gap-4">
             <div className="w-12 h-12 bg-green-600 rounded-lg flex items-center justify-center overflow-hidden shadow-inner shrink-0">
-                {/* Fallback to text if image fails loading, but using the uploaded file path */}
                 <img src={appLogo} alt="Logo" className="w-full h-full object-cover" onError={(e) => e.target.style.display='none'} />
                 <span className="font-bold text-xs text-white absolute" style={{display: 'none'}}>EXIF</span>
             </div>
@@ -290,8 +307,6 @@ export default function ExifPreserverApp() {
                 <h1 className="text-2xl font-bold text-green-400 tracking-tight">EXIF 있음</h1>
                 <p className="text-gray-400 text-sm hidden sm:block">AI 이미지 메타데이터 보존 및 복구 도구</p>
             </div>
-            
-            {/* Added: Creator Info */}
             <div className="ml-auto text-sm text-gray-400 font-medium">
               제작자 : 아카라이브 근첩A
             </div>
@@ -343,7 +358,9 @@ export default function ExifPreserverApp() {
                                 <p className="text-sm text-gray-400">메타데이터 캐시 저장 완료</p>
                             </div>
                             <div className="text-xs text-gray-500 bg-gray-900 p-2 rounded max-h-24 overflow-hidden text-left break-all opacity-70">
-                                {cachedMetadata.type === 'png' ? cachedMetadata.data.substring(0, 100) + "..." : "EXIF Data Cached"}
+                                {cachedMetadata.type === 'png' ? 
+                                    (cachedMetadata.data.find(c => c.keyword === 'parameters') ? "A1111 Metadata Found" : "ComfyUI Metadata Found") 
+                                    : "EXIF Data Cached"}
                             </div>
                         </div>
                     ) : (
@@ -380,10 +397,7 @@ export default function ExifPreserverApp() {
                     
                     {processedImage ? (
                         <div className="relative w-full h-full flex flex-col items-center justify-center z-10">
-                             {/* Image moved to background explicitly and before the overlay content */}
                             <img src={processedImage.url} className="absolute inset-0 w-full h-full object-contain opacity-50 blur-sm" alt="result" />
-                            
-                            {/* Overlay and Buttons now have higher z-index (z-20) and are rendered after the image */}
                             <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center space-y-4 z-20">
                                 <CheckCircle size={48} className="text-green-400" />
                                 <a 
@@ -417,7 +431,6 @@ export default function ExifPreserverApp() {
 
         </div>
 
-        {/* Info Section - Revised for intuitive usage */}
         <div className="bg-gray-800 p-6 rounded-xl border border-gray-700">
             <h3 className="font-bold text-lg mb-4 text-green-400 flex items-center gap-2">
                 <Info size={20} />
@@ -429,21 +442,21 @@ export default function ExifPreserverApp() {
                         <span className="bg-gray-700 w-5 h-5 rounded-full flex items-center justify-center text-xs">1</span>
                         원본 확보
                     </span>
-                    <p>메타데이터(프롬프트)가 살아있는 <strong>원본 사진</strong>을 왼쪽 [1. 원본 불러오기] 칸에 드래그하여 정보를 복사해둡니다.</p>
+                    <p>메타데이터가 살아있는 <strong>원본 사진</strong>(A1111/ComfyUI 모두 지원)을 왼쪽 칸에 드래그합니다.</p>
                 </div>
                  <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700 flex flex-col gap-2">
                     <span className="font-bold text-white flex items-center gap-2">
                         <span className="bg-gray-700 w-5 h-5 rounded-full flex items-center justify-center text-xs">2</span>
                         편집 및 수정
                     </span>
-                    <p>포토샵이나 Reforge, 인페인팅 툴을 사용하여 이미지를 마음껏 수정합니다. (이 과정에서 메타데이터가 날아가도 괜찮습니다.)</p>
+                    <p>포토샵이나 인페인팅 툴로 이미지를 수정합니다. (ComfyUI의 workflow나 prompt 정보가 사라져도 괜찮습니다.)</p>
                 </div>
                  <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700 flex flex-col gap-2">
                     <span className="font-bold text-white flex items-center gap-2">
                         <span className="bg-gray-700 w-5 h-5 rounded-full flex items-center justify-center text-xs">3</span>
                         복구 완료
                     </span>
-                    <p>수정이 끝난 파일을 오른쪽 [2. 수정본 덮어쓰기] 칸에 넣으면, 아까 복사해둔 정보를 다시 심어서 다운로드할 수 있습니다.</p>
+                    <p>오른쪽 칸에 수정된 파일을 넣으면, 원본의 A1111 parameters 또는 ComfyUI workflow/prompt 정보를 모두 다시 심어줍니다.</p>
                 </div>
             </div>
             <p className="mt-4 text-xs text-gray-500 text-center">
@@ -452,7 +465,6 @@ export default function ExifPreserverApp() {
         </div>
       </div>
 
-      {/* Footer - Special Thanks */}
       <footer className="bg-gray-900 border-t border-gray-800 p-6 text-center">
           <p className="text-gray-500 text-sm">
             Special thanks to{' '}
